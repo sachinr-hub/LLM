@@ -64,14 +64,15 @@ st.markdown("""
 
 @st.cache_resource
 def load_model():
-    """Load the FLAN-T5-small model for text generation"""
+    """Load the FLAN-T5-small model for text generation. If loading fails, return (None, None)."""
     try:
         model_name = "google/flan-t5-small"
         tokenizer = T5Tokenizer.from_pretrained(model_name)
         model = T5ForConditionalGeneration.from_pretrained(model_name)
         return tokenizer, model
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
+        # Non-blocking: app can run in template-only mode
+        st.warning(f"AI model not available, running in template-only mode. Details: {str(e)}")
         return None, None
 
 # -----------------------------
@@ -251,6 +252,11 @@ def post_generation_cleanup(text: str, sender_name: str, include_greeting: bool,
 
 def generate_email_response(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str) -> (str, str):
     """Generate email response using FLAN-T5. Returns (response, source)."""
+    # If model unavailable, fallback immediately
+    if tokenizer is None or model is None:
+        response = generate_template_response(original_email, tone, context, sender_name)
+        response = enhance_response_with_context(response, original_email, context)
+        return response, "Template Fallback"
     prompt = f"""
 Tone: {tone}
 Sender Name: {sender_name}
@@ -295,194 +301,204 @@ Response:"""
 def main():
     # Header
     st.markdown('<h1 class="main-header">📧 Enhanced Email Response Generator</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">AI-powered responses with smart templates and automatic name extraction</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">AI-powered responses with smart templates, name extraction, and a new UI</p>', unsafe_allow_html=True)
 
-    # Sidebar settings
-    with st.sidebar:
-        st.header("⚙️ Settings")
-
-        # Tone selection (7 options)
-        tone = st.selectbox(
-            "Select Response Tone:",
-            ["Professional", "Casual", "Apologetic", "Grateful", "Urgent", "Follow-up", "Meeting Request"],
-            key="tone_select",
-            help="Choose the tone that best fits your response needs"
-        )
-
-        # Context input
-        context = st.text_input(
-            "Email Context/Subject:",
-            placeholder="e.g., meeting request, project update, complaint",
-            key="context_input",
-            help="Brief description of what the email is about"
-        )
-
-        # Additional options
-        st.subheader("📋 Additional Options")
-        include_greeting = st.checkbox("Include greeting", value=True, key="include_greeting")
-        include_signature = st.checkbox("Include signature placeholder", value=True, key="include_signature")
-
-        # Quick templates (set both context and tone)
-        st.subheader("🚀 Quick Templates")
-        if st.button("Meeting Request"):
-            st.session_state.context_input = "meeting request"
-            st.session_state.tone_select = "Meeting Request"
-        if st.button("Project Update"):
-            st.session_state.context_input = "project update"
-            st.session_state.tone_select = "Professional"
-        if st.button("Thank You"):
-            st.session_state.context_input = "thank you message"
-            st.session_state.tone_select = "Grateful"
-        if st.button("Apology"):
-            st.session_state.context_input = "apology"
-            st.session_state.tone_select = "Apologetic"
-
-    # Load model once sidebar is ready
+    # Load/Check model
     tokenizer, model = load_model()
-    if tokenizer is None or model is None:
-        st.error("Failed to load the AI model. Please check your internet connection and try again.")
-        st.stop()
 
-    # Main area
-    col1, col2 = st.columns([1, 1])
+    # Status bar
+    status_col1, status_col2, status_col3 = st.columns([1, 1, 1])
+    with status_col1:
+        if tokenizer is not None and model is not None:
+            st.success("Model: FLAN-T5-small ✅")
+        else:
+            st.warning("Model: Unavailable (Template Mode)")
+    with status_col2:
+        st.info("Name Extraction: Enabled")
+    with status_col3:
+        if 'generation_time' in st.session_state:
+            st.caption(f"Last generated: {st.session_state.generation_time}")
 
-    with col1:
-        st.subheader("📨 Original Email")
-        original_email = st.text_area(
-            "Paste the email you want to respond to:",
-            height=300,
-            placeholder="""Example:
-Hi John,
+    # Initialize session_state containers
+    st.session_state.setdefault('history', [])
 
-I hope this email finds you well. I wanted to follow up on our discussion about the marketing campaign. Could we schedule a meeting next week to go over the details?
+    # Tabs for new UI
+    tab_compose, tab_response, tab_history = st.tabs(["📝 Compose", "✨ Response", "📚 History"])
 
-Looking forward to hearing from you.
+    with tab_compose:
+        left, right = st.columns([3, 2])
+        with left:
+            st.subheader("Original Email")
+            original_email = st.text_area(
+                "Paste the email you want to respond to:",
+                height=350,
+                placeholder="""Example:\nHi John,\n\nI hope this email finds you well. I wanted to follow up on our discussion about the marketing campaign. Could we schedule a meeting next week to go over the details?\n\nLooking forward to hearing from you.\n\nBest,\nSarah""",
+                key="original_email_text"
+            )
+        with right:
+            st.subheader("Response Settings")
+            tone = st.selectbox(
+                "Select Response Tone:",
+                ["Professional", "Casual", "Apologetic", "Grateful", "Urgent", "Follow-up", "Meeting Request"],
+                key="tone_select"
+            )
+            context = st.text_input(
+                "Email Context/Subject:",
+                placeholder="e.g., meeting request, project update, complaint",
+                key="context_input"
+            )
+            include_greeting = st.checkbox("Include greeting", value=True, key="include_greeting")
+            include_signature = st.checkbox("Include signature placeholder", value=True, key="include_signature")
 
-Best,
-Sarah""",
-            help="Paste the entire email you received",
-            key="original_email_text"
-        )
+            st.markdown("**Quick Templates**")
+            qt1, qt2, qt3, qt4 = st.columns(4)
+            with qt1:
+                if st.button("Meeting", key="qt_meeting"):
+                    st.session_state.context_input = "meeting request"
+                    st.session_state.tone_select = "Meeting Request"
+            with qt2:
+                if st.button("Update", key="qt_update"):
+                    st.session_state.context_input = "project update"
+                    st.session_state.tone_select = "Professional"
+            with qt3:
+                if st.button("Thank You", key="qt_thanks"):
+                    st.session_state.context_input = "thank you message"
+                    st.session_state.tone_select = "Grateful"
+            with qt4:
+                if st.button("Apology", key="qt_apology"):
+                    st.session_state.context_input = "apology"
+                    st.session_state.tone_select = "Apologetic"
 
-        # Keep context in sync if quick template clicked (already handled by keys)
-        tone = st.session_state.get("tone_select", tone)
-        context = st.session_state.get("context_input", context)
+            st.divider()
+            generate_clicked = st.button("🚀 Generate Response", type="primary", use_container_width=True)
 
-    with col2:
-        st.subheader("✨ Generated Response")
-        if st.button("🚀 Generate Response", type="primary"):
-            if original_email.strip() and context.strip():
+        if generate_clicked:
+            if st.session_state.get('original_email_text', '').strip() and st.session_state.get('context_input', '').strip():
                 with st.spinner("Generating your email response..."):
-                    # Extract sender name from original email
-                    sender_name = extract_sender_name(original_email)
+                    original_email_val = st.session_state['original_email_text']
+                    tone_val = st.session_state['tone_select']
+                    context_val = st.session_state['context_input']
+                    sender_name = extract_sender_name(original_email_val)
 
-                    # Generate with AI, fallback to template if needed
-                    response_text, source = generate_email_response(original_email, tone, context, tokenizer, model, sender_name)
+                    # Generate
+                    response_text, source = generate_email_response(original_email_val, tone_val, context_val, tokenizer, model, sender_name)
+                    final_text = post_generation_cleanup(
+                        response_text,
+                        sender_name,
+                        st.session_state.get("include_greeting", True),
+                        st.session_state.get("include_signature", True)
+                    )
 
-                    # Cleanup placeholders and ensure greeting/signature
-                    final_text = post_generation_cleanup(response_text, sender_name, st.session_state.get("include_greeting", True), st.session_state.get("include_signature", True))
-
-                    # Store in session state
+                    # Store session
                     st.session_state.generated_response = final_text
                     st.session_state.generation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.response_source = source
                     st.session_state.sender_name = sender_name
+
+                    # Append to history
+                    st.session_state.history.append({
+                        "time": st.session_state.generation_time,
+                        "source": source,
+                        "tone": tone_val,
+                        "context": context_val,
+                        "sender": sender_name,
+                        "original": original_email_val,
+                        "response": final_text
+                    })
+                st.success("Response generated! Check the 'Response' tab.")
             else:
                 st.warning("Please provide both the original email and context.")
 
-        # Display generated response
+    with tab_response:
+        st.subheader("Generated Response")
         if 'generated_response' in st.session_state:
-            st.markdown('<div class="response-box">', unsafe_allow_html=True)
-            response_text = st.text_area(
-                "Your Generated Response:",
-                value=st.session_state.generated_response,
-                height=300,
-                help="You can edit this response before using it",
-                key="response_area"
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            # Status transparency
+            # Source badge
             if st.session_state.get("response_source") == "AI Model":
                 st.success("✅ Generated by AI Model (FLAN-T5)")
             else:
                 st.info("ℹ️ Generated by Template Fallback")
 
+            st.markdown('<div class="response-box">', unsafe_allow_html=True)
+            response_text = st.text_area(
+                "Your Generated Response:",
+                value=st.session_state.generated_response,
+                height=320,
+                key="response_area"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
             # Update stored value in case user edits it
             st.session_state.generated_response = response_text
 
-            # Download button
-            st.download_button(
-                label="📥 Download Response",
-                data=response_text,
-                file_name=f"email_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
-            )
-
-            # Copy to Clipboard (robust JS with explicit key)
-            st.markdown(
-                """
-                <script>
-                function copyResponseToClipboard(){
-                    const textareas = parent.document.querySelectorAll('textarea');
-                    let target = null;
-                    for (const ta of textareas){
-                        if (ta.getAttribute('aria-label') === 'Your Generated Response:') { target = ta; break; }
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.download_button(
+                    label="📥 Download Response",
+                    data=response_text,
+                    file_name=f"email_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+            with c2:
+                st.markdown(
+                    """
+                    <script>
+                    function copyResponseToClipboard(){
+                        const textareas = parent.document.querySelectorAll('textarea');
+                        let target = null;
+                        for (const ta of textareas){
+                            if (ta.getAttribute('aria-label') === 'Your Generated Response:') { target = ta; break; }
+                        }
+                        if (target){
+                            navigator.clipboard.writeText(target.value).then(() => {
+                                alert('Response copied to clipboard!');
+                            });
+                        } else {
+                            alert('Could not find response area to copy.');
+                        }
                     }
-                    if (target){
-                        navigator.clipboard.writeText(target.value).then(() => {
-                            alert('Response copied to clipboard!');
-                        });
-                    } else {
-                        alert('Could not find response area to copy.');
-                    }
-                }
-                </script>
-                <button class="copy-btn" onclick="copyResponseToClipboard()">📋 Copy to Clipboard</button>
-                """,
-                unsafe_allow_html=True
-            )
+                    </script>
+                    <button class="copy-btn" onclick="copyResponseToClipboard()">📋 Copy to Clipboard</button>
+                    """,
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("No response yet. Generate one from the Compose tab.")
 
-    # Footer with tips and stats
-    st.markdown("---")
-    st.subheader("💡 Tips for Better Results")
+    with tab_history:
+        st.subheader("Generation History")
+        if st.session_state['history']:
+            # List simple table-like view
+            items = [f"{i+1}. {h['time']} • {h['source']} • {h['tone']} • {h['context']}" for i, h in enumerate(st.session_state['history'])]
+            selected = st.selectbox("Select an entry to view:", options=list(range(len(items))), format_func=lambda i: items[i])
 
-    tips1, tips2, tips3 = st.columns(3)
-    with tips1:
-        st.markdown(
-            """
-            **📝 Original Email**
-            - Include the complete email
-            - Keep sender's name and context
-            - Don't remove important details
-            """
-        )
-    with tips2:
-        st.markdown(
-            """
-            **🎯 Context**
-            - Be specific about the topic
-            - Mention urgency if needed
-            - Include key keywords
-            """
-        )
-    with tips3:
-        st.markdown(
-            """
-            **✨ Tone Selection**
-            - Professional: Business emails
-            - Casual: Friends/colleagues
-            - Apologetic: Mistakes/delays
-            - Urgent/Follow-up/Meeting as needed
-            """
-        )
+            sel = st.session_state['history'][selected]
+            st.markdown(f"**Time:** {sel['time']}  ")
+            st.markdown(f"**Source:** {sel['source']}  ")
+            st.markdown(f"**Tone:** {sel['tone']}  ")
+            st.markdown(f"**Context:** {sel['context']}  ")
+            st.markdown(f"**Sender:** {sel['sender']}  ")
 
-    if 'generated_response' in st.session_state:
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("📊 Session Stats")
-        st.sidebar.info(f"Last generated: {st.session_state.generation_time}")
-        st.sidebar.success("✅ Model loaded successfully")
-        st.sidebar.write(f"Detected sender: {st.session_state.get('sender_name', 'there')}")
+            hc1, hc2, hc3 = st.columns([1,1,1])
+            with hc1:
+                if st.button("Load to Compose"):
+                    st.session_state.original_email_text = sel['original']
+                    st.session_state.tone_select = sel['tone']
+                    st.session_state.context_input = sel['context']
+                    st.success("Loaded into Compose tab.")
+            with hc2:
+                if st.button("Load to Response"):
+                    st.session_state.generated_response = sel['response']
+                    st.session_state.response_source = sel['source']
+                    st.session_state.sender_name = sel['sender']
+                    st.session_state.generation_time = sel['time']
+                    st.success("Loaded into Response tab.")
+            with hc3:
+                if st.button("Delete Entry"):
+                    st.session_state['history'].pop(selected)
+                    st.warning("History entry deleted. Reload the tab to refresh view.")
+        else:
+            st.info("No history yet. Generate a response to start building history.")
 
 
 if __name__ == "__main__":
