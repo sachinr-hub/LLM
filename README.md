@@ -8,13 +8,16 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 
 ## ✨ Features
 
-- 🤖 **AI-Powered Responses**: Uses Google's FLAN-T5 model for intelligent email generation
-- 🎯 **Multiple Tones**: Professional, Casual, Apologetic, Grateful, and Urgent
-- 📝 **Context-Aware**: Generates responses based on email content and context
-- 💾 **Download Responses**: Save generated emails as text files
-- 🎨 **Beautiful UI**: Modern, responsive Streamlit interface
-- 🆓 **100% Free**: No API keys or subscriptions required
-- ⚡ **Fast Generation**: Quick response times with local processing
+- 🤖 **AI-Powered Responses**: Uses Google's FLAN-T5 model locally (with optional fine-tuned checkpoint)
+- 🎯 **Seven Tones**: Professional, Casual, Apologetic, Grateful, Urgent, Follow-up, Meeting Request
+- 🧠 **ML Sentiment Detection**: DistilBERT-based sentiment with rule-based fallback; injected into prompts
+- 📚 **Optional RAG**: TF-IDF over `kb/*.txt` to inject relevant context into the prompt
+- 📝 **Context-Aware**: Name extraction, tone, context, and sentiment-aware prompting
+- 🧩 **Alternative Variants**: Generate multiple response variants
+- 🕓 **History**: View, reload, and manage previously generated responses
+- ⚙️ **Settings**: Persist "Your Name", fine-tuned model path, template-only mode, FP16, and RAG settings
+- 💾 **Download & Copy**: Download responses and copy to clipboard
+- 🎨 **Modern UI**: Tabbed interface (Compose, Response, History, Settings)
 
 ## 🚀 Quick Start
 
@@ -38,7 +41,7 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 
 3. **Run the application**
    ```bash
-   streamlit run email_response_generator.py
+   streamlit run enhanced_email_generator.py
    ```
 
 4. **Open your browser**
@@ -54,11 +57,8 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 ### Step 2: Set Context and Tone
 - **Context**: Briefly describe what the email is about (e.g., "meeting request", "project update")
 - **Tone**: Choose from:
-  - **Professional**: Formal business communication
-  - **Casual**: Friendly, informal responses
-  - **Apologetic**: For mistakes or delays
-  - **Grateful**: Appreciative and thankful
-  - **Urgent**: Time-sensitive matters
+  - **Professional**, **Casual**, **Apologetic**, **Grateful**, **Urgent**, **Follow-up**, **Meeting Request**
+  - Use Quick Templates to prefill context + tone
 
 ### Step 3: Generate Response
 - Click "🚀 Generate Response"
@@ -69,6 +69,28 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 - Copy the response to your email client
 - Download as a text file for later use
 - Edit as needed before sending
+
+### Settings (⚙️ tab)
+- Set your preferred signature name in "Your Name"
+- Optionally provide a local fine-tuned model path (e.g., `models/flan-t5-finetuned`)
+- Toggle Template Mode (skip AI), FP16 on GPU, and RAG with Top-K control
+- Click "Save Settings" to persist to `app_settings.json` and "Reload Model" to apply model changes
+
+### RAG (Optional)
+- Place domain text files under `kb/` as `.txt` files
+- Enable RAG in Settings and set Top-K
+- The app will retrieve relevant snippets and inject them in the prompt under "Relevant Context"
+
+### Sentiment
+- The app uses a DistilBERT pipeline when available, otherwise falls back to rule-based detection
+- Detected sentiment is shown in the Response tab and included in the prompt
+
+### Alternative Variants
+- Use "✨ Generate Alternatives" to produce multiple responses with different sampling
+
+### History
+- The History tab lists prior generations with time, tone, sentiment, and context
+- Load items back into Compose or Response, or delete entries
 
 ## 💡 Tips for Best Results
 
@@ -94,7 +116,7 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 ## 🛠️ Technical Details
 
 ### AI Model
-- **Model**: Google FLAN-T5 Small
+- **Model**: Google FLAN-T5 Small (or optional fine-tuned checkpoint)
 - **Size**: ~250MB download
 - **Performance**: Optimized for speed and quality
 - **Offline**: Works without internet after initial setup
@@ -110,6 +132,36 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 - `torch`: PyTorch for model inference
 - `tokenizers`: Text tokenization
 - `sentencepiece`: Text processing
+- `scikit-learn`: TF-IDF and cosine similarity for RAG and evaluation
+- `datasets` (for fine-tuning script)
+- Optional: `bert-score` for evaluation
+
+## 🧪 Training and Evaluation
+
+### Fine-tuning FLAN-T5
+- Script: `scripts/train_t5_finetune.py`
+- CSV schema: `original_email, sentiment, tone, context, target_response`
+- Example:
+```bash
+python scripts/train_t5_finetune.py \
+  --train_csv data/train.csv \
+  --output_dir models/flan-t5-finetuned \
+  --epochs 3 --batch_size 4 --fp16
+```
+- Point the app Settings → Fine-tuned model path to `models/flan-t5-finetuned`
+
+### Evaluation
+- Script: `scripts/evaluate_generation.py`
+- CSV schema: `pred, ref`
+- TF-IDF cosine similarity:
+```bash
+python scripts/evaluate_generation.py --pairs_csv data/pairs.csv
+```
+- BERTScore (install optional dependency first):
+```bash
+pip install bert-score
+python scripts/evaluate_generation.py --pairs_csv data/pairs.csv --use_bertscore
+```
 
 ## 🌐 Deployment
 
@@ -127,7 +179,7 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
    - Go to [share.streamlit.io](https://share.streamlit.io)
    - Connect your GitHub account
    - Select your repository
-   - Set main file: `email_response_generator.py`
+   - Set main file: `enhanced_email_generator.py`
    - Click "Deploy"
 
 3. **Your app will be live** at `https://your-app-name.streamlit.app`
@@ -136,7 +188,7 @@ A powerful AI-powered email response generator built with Streamlit and Hugging 
 
 To access from other devices on your network:
 ```bash
-streamlit run email_response_generator.py --server.address 0.0.0.0
+streamlit run enhanced_email_generator.py --server.address 0.0.0.0
 ```
 
 ## 🔧 Customization
