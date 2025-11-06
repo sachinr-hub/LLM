@@ -1,10 +1,13 @@
 import streamlit as st
 import torch
-from transformers import T5ForConditionalGeneration, T5Tokenizer
+from transformers import T5ForConditionalGeneration, T5Tokenizer, pipeline
 from datetime import datetime
 import re
 import os
 import json
+import glob
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Page configuration
 st.set_page_config(
@@ -65,7 +68,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @st.cache_resource
-def load_model(force_template: bool = False, finetuned_path: str | None = None):
+def load_model(force_template: bool = False, finetuned_path: str | None = None, use_half_precision: bool = False):
     """Load the FLAN-T5-small (or fine-tuned) model for text generation.
     If loading fails or force_template is True, return (None, None).
     """
@@ -80,6 +83,11 @@ def load_model(force_template: bool = False, finetuned_path: str | None = None):
 
         # Device selection
         device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
+        if use_half_precision and device != "cpu":
+            try:
+                model = model.half()
+            except Exception:
+                pass
         model.to(device)
         return tokenizer, model
     except Exception as e:
@@ -281,7 +289,7 @@ def load_app_settings() -> dict:
                 return json.load(f)
     except Exception:
         pass
-    return {"user_name": "Your Name", "finetuned_model_path": "", "force_template_mode": False}
+    return {"user_name": "Your Name", "finetuned_model_path": "", "force_template_mode": False, "use_half_precision": False, "use_rag": False, "rag_top_k": 3}
 
 def save_app_settings(settings: dict) -> None:
     try:
@@ -312,11 +320,76 @@ def detect_sentiment(email_text: str) -> str:
         return "Positive/Grateful"
     return "Neutral/Informational"
 
+@st.cache_resource
+def load_sentiment_pipeline():
+    """Try to load a DistilBERT sentiment pipeline. Return None on failure."""
+    try:
+        clf = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+        return clf
+    except Exception:
+        return None
+
+def detect_sentiment_ml(email_text: str) -> str:
+    """ML-based sentiment mapped to project categories, fallback to rule-based if pipeline not available."""
+    pipe = load_sentiment_pipeline()
+    if not pipe:
+        return detect_sentiment(email_text)
+    try:
+        out = pipe((email_text or "")[:512])[0]
+        label = str(out.get("label", "NEUTRAL")).upper()
+        if label == "NEGATIVE":
+            base = detect_sentiment(email_text)
+            return base if base != "Neutral/Informational" else "Frustrated/Concerned"
+        if label == "POSITIVE":
+            return "Positive/Grateful"
+        return detect_sentiment(email_text)
+    except Exception:
+        return detect_sentiment(email_text)
+
+# -----------------------------
+# Simple TF-IDF RAG over local KB
+# -----------------------------
+
+KB_DIR = os.path.join(os.path.dirname(__file__), "kb")
+
+@st.cache_resource
+def build_kb_index():
+    try:
+        paths = sorted(glob.glob(os.path.join(KB_DIR, "**", "*.txt"), recursive=True))
+        docs = []
+        names = []
+        for p in paths:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                docs.append(f.read())
+                names.append(os.path.relpath(p, KB_DIR))
+        if not docs:
+            return [], [], None, None
+        vect = TfidfVectorizer(stop_words="english")
+        X = vect.fit_transform(docs)
+        return docs, names, vect, X
+    except Exception:
+        return [], [], None, None
+
+def rag_retrieve(query: str, top_k: int = 3) -> list[str]:
+    docs, names, vect, X = build_kb_index()
+    if vect is None:
+        return []
+    qv = vect.transform([query or ""])  
+    sims = cosine_similarity(qv, X)[0]
+    idxs = sims.argsort()[::-1][:max(1, top_k)]
+    results = []
+    for i in idxs:
+        if sims[i] <= 0:
+            continue
+        snippet = docs[i][:500]
+        results.append(f"[{names[i]}] {snippet}")
+    return results
+
 # -----------------------------
 # AI Generation
 # -----------------------------
 
-def generate_email_response(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None) -> (str, str):
+def generate_email_response(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None, rag_snippets: list[str] | None = None) -> (str, str):
     """Generate email response using FLAN-T5. Returns (response, source)."""
     # If model unavailable, fallback immediately
     if tokenizer is None or model is None:
@@ -324,11 +397,15 @@ def generate_email_response(original_email: str, tone: str, context: str, tokeni
         response = enhance_response_with_context(response, original_email, context)
         return response, "Template Fallback"
     sentiment_line = f"Detected Sentiment: {detected_sentiment}\n" if detected_sentiment else ""
+    rag_block = ""
+    if rag_snippets:
+        joined = "\n".join(f"- {s}" for s in rag_snippets)
+        rag_block = f"\nRelevant Context:\n{joined}\n"
     prompt = f"""
 {sentiment_line}Tone: {tone}
 Sender Name: {sender_name}
 Context/Subject: {context}
-
+{rag_block}
 Instruction: Generate a response email using the specified Tone and Subject. Address the sender by name.
 
 Original email: {original_email}
@@ -362,7 +439,7 @@ Response:"""
         return response, "Template Fallback"
 
 
-def generate_alternative_responses(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None, k: int = 3) -> list[str]:
+def generate_alternative_responses(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None, rag_snippets: list[str] | None = None, k: int = 3) -> list[str]:
     """Generate multiple alternative responses using sampling. Falls back to single template variant if model unavailable."""
     if tokenizer is None or model is None:
         base = generate_template_response(original_email, tone, context, sender_name)
@@ -370,11 +447,15 @@ def generate_alternative_responses(original_email: str, tone: str, context: str,
         return [enhanced]
 
     sentiment_line = f"Detected Sentiment: {detected_sentiment}\n" if detected_sentiment else ""
+    rag_block = ""
+    if rag_snippets:
+        joined = "\n".join(f"- {s}" for s in rag_snippets)
+        rag_block = f"\nRelevant Context:\n{joined}\n"
     prompt = f"""
 {sentiment_line}Tone: {tone}
 Sender Name: {sender_name}
 Context/Subject: {context}
-
+{rag_block}
 Instruction: Generate a response email using the specified Tone and Subject. Address the sender by name.
 
 Original email: {original_email}
@@ -423,11 +504,15 @@ def main():
     st.session_state.setdefault('user_name', settings.get('user_name', 'Your Name'))
     st.session_state.setdefault('finetuned_model_path', settings.get('finetuned_model_path', ''))
     st.session_state.setdefault('force_template_mode', settings.get('force_template_mode', False))
+    st.session_state.setdefault('use_half_precision', settings.get('use_half_precision', False))
+    st.session_state.setdefault('use_rag', settings.get('use_rag', False))
+    st.session_state.setdefault('rag_top_k', settings.get('rag_top_k', 3))
 
     # Load/Check model
     tokenizer, model = load_model(
         force_template=st.session_state.get('force_template_mode', False),
         finetuned_path=st.session_state.get('finetuned_model_path') or None,
+        use_half_precision=st.session_state.get('use_half_precision', False),
     )
 
     # Status bar
@@ -439,6 +524,8 @@ def main():
             st.warning("Model: Unavailable (Template Mode)")
     with status_col2:
         st.info("Name Extraction: Enabled")
+        if st.session_state.get('use_rag', False):
+            st.caption("RAG: ON")
     with status_col3:
         if 'generation_time' in st.session_state:
             st.caption(f"Last generated: {st.session_state.generation_time}")
@@ -498,10 +585,11 @@ def main():
                     tone_val = st.session_state['tone_select']
                     context_val = st.session_state['context_input']
                     sender_name = extract_sender_name(original_email_val)
-                    detected_sentiment = detect_sentiment(original_email_val)
+                    detected_sentiment = detect_sentiment_ml(original_email_val)
+                    rag_snippets = rag_retrieve(original_email_val, top_k=int(st.session_state.get('rag_top_k',3))) if st.session_state.get('use_rag', False) else []
 
                     # Generate
-                    response_text, source = generate_email_response(original_email_val, tone_val, context_val, tokenizer, model, sender_name, detected_sentiment)
+                    response_text, source = generate_email_response(original_email_val, tone_val, context_val, tokenizer, model, sender_name, detected_sentiment, rag_snippets)
                     final_text = post_generation_cleanup(
                         response_text,
                         sender_name,
@@ -526,7 +614,8 @@ def main():
                         "sender": sender_name,
                         "original": original_email_val,
                         "response": final_text,
-                        "sentiment": detected_sentiment
+                        "sentiment": detected_sentiment,
+                        "rag": rag_snippets
                     })
                 st.success("Response generated! Check the 'Response' tab.")
             else:
@@ -589,13 +678,15 @@ def main():
                 )
             with c3:
                 if st.button("✨ Generate Alternatives", use_container_width=True):
+                    alt_rag = rag_retrieve(st.session_state.get('original_email_text', ''), top_k=int(st.session_state.get('rag_top_k',3))) if st.session_state.get('use_rag', False) else []
                     variants = generate_alternative_responses(
                         st.session_state.get('original_email_text', ''),
                         st.session_state.get('tone_select', 'Professional'),
                         st.session_state.get('context_input', ''),
                         tokenizer, model,
                         st.session_state.get('sender_name', 'there'),
-                        st.session_state.get('detected_sentiment')
+                        st.session_state.get('detected_sentiment'),
+                        alt_rag
                     )
                     st.session_state['alt_variants'] = [
                         post_generation_cleanup(v, st.session_state.get('sender_name','there'),
@@ -629,6 +720,10 @@ def main():
             st.markdown(f"**Sender:** {sel['sender']}  ")
             if sel.get('sentiment'):
                 st.markdown(f"**Sentiment:** {sel['sentiment']}  ")
+            if sel.get('rag'):
+                with st.expander("RAG Context Used"):
+                    for r in sel['rag']:
+                        st.write(r)
 
             hc1, hc2, hc3 = st.columns([1,1,1])
             with hc1:
@@ -656,6 +751,9 @@ def main():
         user_name = st.text_input("Your Name (used in signature)", value=st.session_state.get('user_name','Your Name'))
         finetuned_model_path = st.text_input("Fine-tuned model path (optional)", value=st.session_state.get('finetuned_model_path',''))
         force_template_mode = st.checkbox("Force Template Mode (skip AI model)", value=st.session_state.get('force_template_mode', False))
+        use_half_precision = st.checkbox("Use Half Precision (FP16 on GPU)", value=st.session_state.get('use_half_precision', False))
+        use_rag = st.checkbox("Enable RAG with local knowledge base (kb/*.txt)", value=st.session_state.get('use_rag', False))
+        rag_top_k = st.number_input("RAG: Top-K documents", min_value=1, max_value=10, value=int(st.session_state.get('rag_top_k', 3)))
 
         s1, s2 = st.columns([1,1])
         with s1:
@@ -663,13 +761,19 @@ def main():
                 new_settings = {
                     "user_name": user_name or "Your Name",
                     "finetuned_model_path": finetuned_model_path or "",
-                    "force_template_mode": bool(force_template_mode)
+                    "force_template_mode": bool(force_template_mode),
+                    "use_half_precision": bool(use_half_precision),
+                    "use_rag": bool(use_rag),
+                    "rag_top_k": int(rag_top_k),
                 }
                 save_app_settings(new_settings)
                 # mirror to session
                 st.session_state['user_name'] = new_settings['user_name']
                 st.session_state['finetuned_model_path'] = new_settings['finetuned_model_path']
                 st.session_state['force_template_mode'] = new_settings['force_template_mode']
+                st.session_state['use_half_precision'] = new_settings['use_half_precision']
+                st.session_state['use_rag'] = new_settings['use_rag']
+                st.session_state['rag_top_k'] = new_settings['rag_top_k']
                 st.success("Settings saved. Restart the app or click 'Reload Model' to apply model changes.")
         with s2:
             if st.button("🔁 Reload Model", use_container_width=True):
@@ -678,6 +782,7 @@ def main():
                 _tok, _mod = load_model(
                     force_template=st.session_state.get('force_template_mode', False),
                     finetuned_path=st.session_state.get('finetuned_model_path') or None,
+                    use_half_precision=st.session_state.get('use_half_precision', False),
                 )
                 st.success("Model reload requested. Navigate to Compose to generate.")
 
