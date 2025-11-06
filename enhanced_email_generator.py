@@ -3,6 +3,8 @@ import torch
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 from datetime import datetime
 import re
+import os
+import json
 
 # Page configuration
 st.set_page_config(
@@ -63,12 +65,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @st.cache_resource
-def load_model():
-    """Load the FLAN-T5-small model for text generation. If loading fails, return (None, None)."""
+def load_model(force_template: bool = False, finetuned_path: str | None = None):
+    """Load the FLAN-T5-small (or fine-tuned) model for text generation.
+    If loading fails or force_template is True, return (None, None).
+    """
     try:
-        model_name = "google/flan-t5-small"
+        if force_template:
+            st.info("Force Template Mode is ON. Skipping model load.")
+            return None, None
+
+        model_name = finetuned_path if (finetuned_path and os.path.exists(finetuned_path)) else "google/flan-t5-small"
         tokenizer = T5Tokenizer.from_pretrained(model_name)
         model = T5ForConditionalGeneration.from_pretrained(model_name)
+
+        # Device selection
+        device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
+        model.to(device)
         return tokenizer, model
     except Exception as e:
         # Non-blocking: app can run in template-only mode
@@ -220,9 +232,9 @@ def enhance_response_with_context(response: str, original_email: str, context: s
     return response
 
 
-def post_generation_cleanup(text: str, sender_name: str, include_greeting: bool, include_signature: bool) -> str:
+def post_generation_cleanup(text: str, sender_name: str, include_greeting: bool, include_signature: bool, user_name: str = "Your Name") -> str:
     """Replace placeholders and optionally ensure greeting/signature are present."""
-    user_name_placeholder = "Your Name"
+    user_name_placeholder = user_name or "Your Name"
 
     # Replace generic placeholders
     replacements = {
@@ -257,18 +269,63 @@ def set_quick_template(context_val: str, tone_val: str):
     st.rerun()
 
 # -----------------------------
+# Settings persistence
+# -----------------------------
+
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "app_settings.json")
+
+def load_app_settings() -> dict:
+    try:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"user_name": "Your Name", "finetuned_model_path": "", "force_template_mode": False}
+
+def save_app_settings(settings: dict) -> None:
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        st.warning(f"Failed to save settings: {e}")
+
+# -----------------------------
+# Sentiment detection (rule-based stub)
+# -----------------------------
+
+def detect_sentiment(email_text: str) -> str:
+    """Very lightweight rule-based sentiment detector. Can be replaced by a classifier later."""
+    text = (email_text or "").lower()
+    urgency = any(w in text for w in ["urgent", "asap", "immediately", "priority", "right away"])
+    gratitude = any(w in text for w in ["thank you", "thanks", "appreciate", "grateful"])    
+    apology = any(w in text for w in ["sorry", "apologize", "apologies"]) 
+    frustration = any(w in text for w in ["disappointed", "frustrated", "angry", "upset"]) 
+
+    if urgency:
+        return "Urgent/Demanding"
+    if frustration:
+        return "Frustrated/Concerned"
+    if apology:
+        return "Apologetic"
+    if gratitude:
+        return "Positive/Grateful"
+    return "Neutral/Informational"
+
+# -----------------------------
 # AI Generation
 # -----------------------------
 
-def generate_email_response(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str) -> (str, str):
+def generate_email_response(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None) -> (str, str):
     """Generate email response using FLAN-T5. Returns (response, source)."""
     # If model unavailable, fallback immediately
     if tokenizer is None or model is None:
         response = generate_template_response(original_email, tone, context, sender_name)
         response = enhance_response_with_context(response, original_email, context)
         return response, "Template Fallback"
+    sentiment_line = f"Detected Sentiment: {detected_sentiment}\n" if detected_sentiment else ""
     prompt = f"""
-Tone: {tone}
+{sentiment_line}Tone: {tone}
 Sender Name: {sender_name}
 Context/Subject: {context}
 
@@ -304,6 +361,54 @@ Response:"""
         response = enhance_response_with_context(response, original_email, context)
         return response, "Template Fallback"
 
+
+def generate_alternative_responses(original_email: str, tone: str, context: str, tokenizer, model, sender_name: str, detected_sentiment: str | None = None, k: int = 3) -> list[str]:
+    """Generate multiple alternative responses using sampling. Falls back to single template variant if model unavailable."""
+    if tokenizer is None or model is None:
+        base = generate_template_response(original_email, tone, context, sender_name)
+        enhanced = enhance_response_with_context(base, original_email, context)
+        return [enhanced]
+
+    sentiment_line = f"Detected Sentiment: {detected_sentiment}\n" if detected_sentiment else ""
+    prompt = f"""
+{sentiment_line}Tone: {tone}
+Sender Name: {sender_name}
+Context/Subject: {context}
+
+Instruction: Generate a response email using the specified Tone and Subject. Address the sender by name.
+
+Original email: {original_email}
+
+Response:"""
+
+    try:
+        inputs = tokenizer.encode(prompt, return_tensors="pt", max_length=512, truncation=True)
+        with torch.no_grad():
+            outputs = model.generate(
+                inputs,
+                max_length=300,
+                num_return_sequences=k,
+                temperature=0.9,
+                do_sample=True,
+                top_p=0.92,
+                top_k=50,
+                pad_token_id=tokenizer.pad_token_id
+            )
+        variants = []
+        for i in range(len(outputs)):
+            text = tokenizer.decode(outputs[i], skip_special_tokens=True)
+            text = text.replace(prompt, "").strip()
+            if len(text) >= 40:
+                variants.append(text)
+        if not variants:
+            # fallback
+            base = generate_template_response(original_email, tone, context, sender_name)
+            variants = [enhance_response_with_context(base, original_email, context)]
+        return variants
+    except Exception:
+        base = generate_template_response(original_email, tone, context, sender_name)
+        return [enhance_response_with_context(base, original_email, context)]
+
 # -----------------------------
 # App
 # -----------------------------
@@ -313,8 +418,17 @@ def main():
     st.markdown('<h1 class="main-header">📧 Enhanced Email Response Generator</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">AI-powered responses with smart templates, name extraction, and a new UI</p>', unsafe_allow_html=True)
 
+    # Load settings
+    settings = load_app_settings()
+    st.session_state.setdefault('user_name', settings.get('user_name', 'Your Name'))
+    st.session_state.setdefault('finetuned_model_path', settings.get('finetuned_model_path', ''))
+    st.session_state.setdefault('force_template_mode', settings.get('force_template_mode', False))
+
     # Load/Check model
-    tokenizer, model = load_model()
+    tokenizer, model = load_model(
+        force_template=st.session_state.get('force_template_mode', False),
+        finetuned_path=st.session_state.get('finetuned_model_path') or None,
+    )
 
     # Status bar
     status_col1, status_col2, status_col3 = st.columns([1, 1, 1])
@@ -333,7 +447,7 @@ def main():
     st.session_state.setdefault('history', [])
 
     # Tabs for new UI
-    tab_compose, tab_response, tab_history = st.tabs(["📝 Compose", "✨ Response", "📚 History"])
+    tab_compose, tab_response, tab_history, tab_settings = st.tabs(["📝 Compose", "✨ Response", "📚 History", "⚙️ Settings"])
 
     with tab_compose:
         left, right = st.columns([3, 2])
@@ -384,14 +498,16 @@ def main():
                     tone_val = st.session_state['tone_select']
                     context_val = st.session_state['context_input']
                     sender_name = extract_sender_name(original_email_val)
+                    detected_sentiment = detect_sentiment(original_email_val)
 
                     # Generate
-                    response_text, source = generate_email_response(original_email_val, tone_val, context_val, tokenizer, model, sender_name)
+                    response_text, source = generate_email_response(original_email_val, tone_val, context_val, tokenizer, model, sender_name, detected_sentiment)
                     final_text = post_generation_cleanup(
                         response_text,
                         sender_name,
                         st.session_state.get("include_greeting", True),
-                        st.session_state.get("include_signature", True)
+                        st.session_state.get("include_signature", True),
+                        st.session_state.get('user_name', 'Your Name')
                     )
 
                     # Store session
@@ -399,6 +515,7 @@ def main():
                     st.session_state.generation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.response_source = source
                     st.session_state.sender_name = sender_name
+                    st.session_state.detected_sentiment = detected_sentiment
 
                     # Append to history
                     st.session_state.history.append({
@@ -408,7 +525,8 @@ def main():
                         "context": context_val,
                         "sender": sender_name,
                         "original": original_email_val,
-                        "response": final_text
+                        "response": final_text,
+                        "sentiment": detected_sentiment
                     })
                 st.success("Response generated! Check the 'Response' tab.")
             else:
@@ -417,11 +535,13 @@ def main():
     with tab_response:
         st.subheader("Generated Response")
         if 'generated_response' in st.session_state:
-            # Source badge
+            # Source and sentiment badges
             if st.session_state.get("response_source") == "AI Model":
                 st.success("✅ Generated by AI Model (FLAN-T5)")
             else:
                 st.info("ℹ️ Generated by Template Fallback")
+            if st.session_state.get("detected_sentiment"):
+                st.caption(f"Detected Sentiment: {st.session_state['detected_sentiment']}")
 
             st.markdown('<div class="response-box">', unsafe_allow_html=True)
             response_text = st.text_area(
@@ -435,7 +555,7 @@ def main():
             # Update stored value in case user edits it
             st.session_state.generated_response = response_text
 
-            c1, c2 = st.columns([1, 1])
+            c1, c2, c3 = st.columns([1, 1, 1])
             with c1:
                 st.download_button(
                     label="📥 Download Response",
@@ -467,6 +587,30 @@ def main():
                     """,
                     unsafe_allow_html=True
                 )
+            with c3:
+                if st.button("✨ Generate Alternatives", use_container_width=True):
+                    variants = generate_alternative_responses(
+                        st.session_state.get('original_email_text', ''),
+                        st.session_state.get('tone_select', 'Professional'),
+                        st.session_state.get('context_input', ''),
+                        tokenizer, model,
+                        st.session_state.get('sender_name', 'there'),
+                        st.session_state.get('detected_sentiment')
+                    )
+                    st.session_state['alt_variants'] = [
+                        post_generation_cleanup(v, st.session_state.get('sender_name','there'),
+                                                st.session_state.get('include_greeting', True),
+                                                st.session_state.get('include_signature', True),
+                                                st.session_state.get('user_name','Your Name'))
+                        for v in variants
+                    ]
+
+            if 'alt_variants' in st.session_state:
+                st.markdown("---")
+                st.subheader("Alternative Responses")
+                for i, v in enumerate(st.session_state['alt_variants'], start=1):
+                    with st.expander(f"Variant {i}"):
+                        st.code(v)
         else:
             st.info("No response yet. Generate one from the Compose tab.")
 
@@ -474,7 +618,7 @@ def main():
         st.subheader("Generation History")
         if st.session_state['history']:
             # List simple table-like view
-            items = [f"{i+1}. {h['time']} • {h['source']} • {h['tone']} • {h['context']}" for i, h in enumerate(st.session_state['history'])]
+            items = [f"{i+1}. {h['time']} • {h['source']} • {h['tone']} • {h['context']} • {h.get('sentiment','')}" for i, h in enumerate(st.session_state['history'])]
             selected = st.selectbox("Select an entry to view:", options=list(range(len(items))), format_func=lambda i: items[i])
 
             sel = st.session_state['history'][selected]
@@ -483,6 +627,8 @@ def main():
             st.markdown(f"**Tone:** {sel['tone']}  ")
             st.markdown(f"**Context:** {sel['context']}  ")
             st.markdown(f"**Sender:** {sel['sender']}  ")
+            if sel.get('sentiment'):
+                st.markdown(f"**Sentiment:** {sel['sentiment']}  ")
 
             hc1, hc2, hc3 = st.columns([1,1,1])
             with hc1:
@@ -504,6 +650,36 @@ def main():
                     st.warning("History entry deleted. Reload the tab to refresh view.")
         else:
             st.info("No history yet. Generate a response to start building history.")
+
+    with tab_settings:
+        st.subheader("Application Settings")
+        user_name = st.text_input("Your Name (used in signature)", value=st.session_state.get('user_name','Your Name'))
+        finetuned_model_path = st.text_input("Fine-tuned model path (optional)", value=st.session_state.get('finetuned_model_path',''))
+        force_template_mode = st.checkbox("Force Template Mode (skip AI model)", value=st.session_state.get('force_template_mode', False))
+
+        s1, s2 = st.columns([1,1])
+        with s1:
+            if st.button("💾 Save Settings", use_container_width=True):
+                new_settings = {
+                    "user_name": user_name or "Your Name",
+                    "finetuned_model_path": finetuned_model_path or "",
+                    "force_template_mode": bool(force_template_mode)
+                }
+                save_app_settings(new_settings)
+                # mirror to session
+                st.session_state['user_name'] = new_settings['user_name']
+                st.session_state['finetuned_model_path'] = new_settings['finetuned_model_path']
+                st.session_state['force_template_mode'] = new_settings['force_template_mode']
+                st.success("Settings saved. Restart the app or click 'Reload Model' to apply model changes.")
+        with s2:
+            if st.button("🔁 Reload Model", use_container_width=True):
+                # Clear cache and reload
+                load_model.clear()
+                _tok, _mod = load_model(
+                    force_template=st.session_state.get('force_template_mode', False),
+                    finetuned_path=st.session_state.get('finetuned_model_path') or None,
+                )
+                st.success("Model reload requested. Navigate to Compose to generate.")
 
 
 if __name__ == "__main__":
