@@ -247,6 +247,16 @@ def post_generation_cleanup(text: str, sender_name: str, include_greeting: bool,
     return cleaned
 
 # -----------------------------
+# Callbacks / Helpers
+# -----------------------------
+
+def set_quick_template(context_val: str, tone_val: str):
+    """Set quick template values before widgets render and rerun."""
+    st.session_state["context_input"] = context_val
+    st.session_state["tone_select"] = tone_val
+    st.rerun()
+
+# -----------------------------
 # AI Generation
 # -----------------------------
 
@@ -337,6 +347,20 @@ def main():
             )
         with right:
             st.subheader("Response Settings")
+
+            # Quick Templates FIRST: use callbacks to set state and rerun before widgets are built
+            st.markdown("**Quick Templates**")
+            qt1, qt2, qt3, qt4 = st.columns(4)
+            with qt1:
+                st.button("Meeting", key="qt_meeting", on_click=set_quick_template, kwargs={"context_val": "meeting request", "tone_val": "Meeting Request"})
+            with qt2:
+                st.button("Update", key="qt_update", on_click=set_quick_template, kwargs={"context_val": "project update", "tone_val": "Professional"})
+            with qt3:
+                st.button("Thank You", key="qt_thanks", on_click=set_quick_template, kwargs={"context_val": "thank you message", "tone_val": "Grateful"})
+            with qt4:
+                st.button("Apology", key="qt_apology", on_click=set_quick_template, kwargs={"context_val": "apology", "tone_val": "Apologetic"})
+
+            # Now render widgets bound to those keys
             tone = st.selectbox(
                 "Select Response Tone:",
                 ["Professional", "Casual", "Apologetic", "Grateful", "Urgent", "Follow-up", "Meeting Request"],
@@ -349,25 +373,6 @@ def main():
             )
             include_greeting = st.checkbox("Include greeting", value=True, key="include_greeting")
             include_signature = st.checkbox("Include signature placeholder", value=True, key="include_signature")
-
-            st.markdown("**Quick Templates**")
-            qt1, qt2, qt3, qt4 = st.columns(4)
-            with qt1:
-                if st.button("Meeting", key="qt_meeting"):
-                    st.session_state.context_input = "meeting request"
-                    st.session_state.tone_select = "Meeting Request"
-            with qt2:
-                if st.button("Update", key="qt_update"):
-                    st.session_state.context_input = "project update"
-                    st.session_state.tone_select = "Professional"
-            with qt3:
-                if st.button("Thank You", key="qt_thanks"):
-                    st.session_state.context_input = "thank you message"
-                    st.session_state.tone_select = "Grateful"
-            with qt4:
-                if st.button("Apology", key="qt_apology"):
-                    st.session_state.context_input = "apology"
-                    st.session_state.tone_select = "Apologetic"
 
             st.divider()
             generate_clicked = st.button("🚀 Generate Response", type="primary", use_container_width=True)
